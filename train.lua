@@ -147,18 +147,9 @@ function train(model, criterion, trainset, testset)
 		-- FIXME: this is super ugly and needs to be cleaned up.
 		-- Which means that the pixelCNN needs to be modified to do multiple channels,
 		-- and properly select slices of the input when too many channels are provided as input. Maybe.
-		local input = torch.Tensor(1,1,opt.width,opt.height)
-		local source = testset.data[torch.random(1,testset.size)]
-		source[1]:fill(0)
-		source[2]:fill(1)
-		input[{1,1,{},{}}] = source:select(1,3)
+		local input = testset.data[torch.random(1,testset.size)]
 		local output = model:forward(input)
-		local img = pixelCNN.toImage({output})
-
-		-- The V channel's in the wrong place. Yay.
-		img = img[1]
-		img[3] = img[1]
-		img[1]:fill(0)
+		local img = pixelCNN.toImage(output)
 
 		-- print(input[1]:size(), img[1]:size())
 		gfx.image({image.hsv2rgb(source), image.hsv2rgb(img)}, {width = 300, win = "asdf"})
@@ -199,55 +190,77 @@ end
 print("----- Creating model.")
 nngraph.setDebug(true)
 
-local model = pixelCNN.GatedPixelConvolution(3, 8, 7, 1, 2)
+local model = nn.Sequential()
+model:add(pixelCNN.inputLayer(8, 7, 1))
+model:add(pixelCNN.GatedPixelConvolution(8, 16, 3, 1))
+
+
 model.name = "validate"
--- print(infer(model, {torch.Tensor(10,3,32,32), torch.Tensor(10,3,32,32)})[1]:size())
+print(infer(model, torch.Tensor(10,3,32,32))[1]:size())
+
+print(infer(model, torch.Tensor(3,32,32))[1]:size())
 
 
-local input = - nn.Replicate(2)
-local network = input 
-	- nn.SplitTable(1)
-	- pixelCNN.GatedPixelConvolution(1, 64, 7, 1, 1) 
-	- pixelCNN.GatedPixelConvolution(64, 64, 5, 1, 2)
-	- pixelCNN.GatedPixelConvolution(64, 256, 5, 1, 3)
-	- pixelCNN.GatedPixelConvolution(256, 256, 5, 1, 4)
-	- nn.SelectTable(2)
-	- pixelCNN.MultiChannelSpatialSoftMax(1)
+local helper = pixelCNN.Helper()
+helper:addLayer(16, 7)
+helper:addLayer(32, 3)
+helper:addLayer(32, 3)
+helper:addLayer(32, 3)
+helper:addLayer(32, 3)
+helper:addLayer(32, 3)
 
--- TODO: input pre-processing
--- the paper uses centering and scaling; that's it.
--- play with ZCA and HSV as well.
--- paper uses RMSProp for optimization.
--- nll loss function
--- batch normalization?
+local model = helper:generate("test")
 
-local model = nn.gModule({input}, {network})
-model.name = "pixelcnn"
+-- print(infer(model, torch.Tensor(3,32,32)))
+print(model:forward(torch.Tensor(3,32,32)))
 
-print(string.format("model has %d parameters", model:getParameters():size()[1]))
+-- TODO: visualize the network after running to ensure that it's doing the job
+-- properly. May be easiest to make it shit itself at the very last step.
 
--- print(model:forward({torch.Tensor(3,32,32), torch.Tensor(3,32,32)}))
+-- local input = - nn.Replicate(2)
+-- local network = input 
+-- 	- nn.SplitTable(1)
+-- 	- pixelCNN.GatedPixelConvolution(1, 64, 7, 1, 1) 
+-- 	- pixelCNN.GatedPixelConvolution(64, 64, 5, 1, 2)
+-- 	- pixelCNN.GatedPixelConvolution(64, 256, 5, 1, 3)
+-- 	- pixelCNN.GatedPixelConvolution(256, 256, 5, 1, 4)
+-- 	- nn.SelectTable(2)
+-- 	- pixelCNN.MultiChannelSpatialSoftMax(1)
 
-local input = torch.rand(5,1,32,32)
+-- -- TODO: input pre-processing
+-- -- the paper uses centering and scaling; that's it.
+-- -- play with ZCA and HSV as well.
+-- -- paper uses RMSProp for optimization.
+-- -- nll loss function
+-- -- batch normalization?
 
--- graphgen(model, input, "unoptimized")
-local time = torch.Timer()
-local out = infer(model, input)
-print("model takes " .. time:time().real .. "s")
-print("output dims are", out:size())
+-- local model = nn.gModule({input}, {network})
+-- model.name = "pixelcnn"
 
--- gfx.image(pixelCNN.toImage({out}))
-print("Model valid.")
+-- print(string.format("model has %d parameters", model:getParameters():size()[1]))
 
-print("----- Loading dataset.")
-print(string.format("cache location is %s", opt.cache))
+-- -- print(model:forward({torch.Tensor(3,32,32), torch.Tensor(3,32,32)}))
 
-require('data')
-local trainset, testset = data.load("data/tgif-v1.0.tsv", opt.width, opt.height, opt.images, .9, opt.cache)
-print(string.format("training set has %d images", trainset.size))
-print(string.format("test set has %d images", testset.size))
+-- local input = torch.rand(5,1,32,32)
 
-local criterion = nn.CrossEntropyCriterion()
+-- -- graphgen(model, input, "unoptimized")
+-- local time = torch.Timer()
+-- local out = infer(model, input)
+-- print("model takes " .. time:time().real .. "s")
+-- print("output dims are", out:size())
 
-print("----- Starting training.")
-train(model, criterion, trainset, testset)
+-- -- gfx.image(pixelCNN.toImage({out}))
+-- print("Model valid.")
+
+-- print("----- Loading dataset.")
+-- print(string.format("cache location is %s", opt.cache))
+
+-- require('data')
+-- local trainset, testset = data.load("data/tgif-v1.0.tsv", opt.width, opt.height, opt.images, .9, opt.cache)
+-- print(string.format("training set has %d images", trainset.size))
+-- print(string.format("test set has %d images", testset.size))
+
+-- local criterion = nn.CrossEntropyCriterion()
+
+-- print("----- Starting training.")
+-- train(model, criterion, trainset, testset)
