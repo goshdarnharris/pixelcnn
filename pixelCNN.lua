@@ -156,18 +156,12 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 	-- If we're at the second layer, a channel doesn't look at itself as an input.
 	-- If we're at a later layer, it does.
 
-	-- In each layer, there is one full convolutional unit per channel. The layer takes in
+	-- In each layer, there is one full vertical & horizontal stack per channel. The layer takes in
 	-- N x M x channels x nInputPlane features.
 	-- Beyond the 2nd layer, each channel takes every channel up to and including itself as
 	-- and input, and each channel produces an N x M x nOutputPlane output.
 	-- At the second layer, this is the same except each channel does not take its corresponding input.
 	-- At the first layer, the input is N x M x channels in size.
-
-	-- Can I do this simply by masking convolutions?
-	-- for a 3 channel input:
-	-- the first third of the kernels masks out all but the first channel
-	-- the second third masks out the third channel
-	-- the final third masks nothing out
 
 	-- It may be simpler to just have 3 parallel convolutional stacks, and concatenate their
 	-- outputs. I -think- that's entirely equivalent, though that depends on what the gated
@@ -180,9 +174,6 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 
 	-- TODO: implement dilated convolutions a la wavenet
 
-	-- Vertical stack can only depend on pixels above the current pixel. This can be achieved by 
-	-- using a filter of half height, and padding the input appropriately.
-
 	local hstack_in = {}
 	local hstack_out = {}
 	local vstack_in = {}
@@ -193,10 +184,17 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 	local vstack_out_all
 
 	for channel=1,channels do
+
+		-- Each stack has a convolution that outputs 2*nOutputPlane features. These are split
+		-- at the gate; the first nOutputPlane features go to the left gate and the second
+		-- nOutputPlane features go to the right gate.
+
+
+		-- Create vertical padding, convolution, and crop
 		local vertical_conv, vertical_pad
 		do
 			local kW = kernel_size
-			local kH = math.floor(kernel_size/2) -- Paper says ceil. I don't believe it.
+			local kH = math.floor(kernel_size/2) -- Paper says ceil. There are only floor rows above the current pixel...
 			local dW = kernel_step
 			local dH = kernel_step
 			local padW = 0
@@ -214,6 +212,7 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 			vertical_crop = nn.SpatialZeroPadding(0, 0, 0, -1)
 		end
 
+		-- Create horizontal padding, convolution, and crop
 		local horiz_conv, horiz_pad
 		do
 			local kH = 1
@@ -230,15 +229,13 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 			end
 
 			horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), 0, 0, 0)
-			-- nn.Padding(3, -math.floor(kernel_size/2), 3)
 			horiz_conv = nn.SpatialConvolution(nInputPlane*channel, 2*nOutputPlane, kW, kH, dW, dH, padW, padH)
-			local params,_ = horiz_conv:getParameters()
-			-- print("horizontal convolution has " .. params:storage():size() .. " hidden units")
 
 			if layer == 1 then
 				-- Sizes mean we'll still have 1 extra pixel on the right side of the image. Get rid of it.
 				horiz_crop = nn.SpatialZeroPadding(0, -1, 0, 0)
 			else
+				-- Since other layers use a wider convolution, the extra pixel will already be gone.
 				horiz_crop = nn.Identity()
 			end
 		end
@@ -249,6 +246,14 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 		-- We need to select the features from the input corresponding to this channel and all before it.
 		-- We assume that the number of input planes (like the # of output planes we generate) is per-channel,
 		-- so for each channel we need to grab that many and all of the ones leading up to it.
+		-- channel 1 sees only channel 1
+		-- channel 2 sees channels 1 and 2
+		-- channel 3 sees channels 1, 2, and 3
+
+		-- FIXME: maybe not doing channels correctly
+		-- From the pixelRNN paper: p(xi,R|x<i)p(xi,G|x<i, xi,R)p(xi,B|x<i, xi,R, xi,G) = p(xi|x<i)
+		-- Each channel uses all channels from previous pixels and other channels from the same pixel.
+		-- Which is to say I'm not sure Im' doing this right.
 
 		local graphAttributes = {
 			color = channel_colors[channel]
@@ -378,6 +383,9 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 	hstack_out_all = nn.JoinTable(1,3)(hstack_out)
 	vstack_out_all = nn.JoinTable(1,3)(vstack_out)
 
+	-- FIXME: is this correct? the paper mentions combining the outputs after each layer, but also
+	-- mentions that combining the horizontal stack with the vertical stack would allow the vertical
+	-- stack to see future pixels. Hmm.
 	return nn.gModule({vstack_in_all, hstack_in_all}, {vstack_out_all, hstack_out_all})
 end
 

@@ -204,15 +204,16 @@ print(infer(model, torch.Tensor(3,32,32))[1]:size())
 local helper = pixelCNN.Helper()
 helper:addLayer(16, 7)
 helper:addLayer(32, 3)
-helper:addLayer(32, 3)
-helper:addLayer(32, 3)
-helper:addLayer(32, 3)
-helper:addLayer(32, 3)
 
 local model = helper:generate("test")
 
 -- print(infer(model, torch.Tensor(3,32,32)))
 print(model:forward(torch.Tensor(3,32,32)))
+
+nngraph.display(helper.layers[1].layer)
+nngraph.display(helper.layers[2].layer)
+-- graph.dot(helper.layers[1].layer.fg, 'input', 'input')
+-- graph.dot(helper.layers[2].layer.fg, 'pixelcnn', 'pixelcnn')
 
 -- TODO: visualize the network after running to ensure that it's doing the job
 -- properly. May be easiest to make it shit itself at the very last step.
