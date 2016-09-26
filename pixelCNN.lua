@@ -255,6 +255,38 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 		-- Each channel uses all channels from previous pixels and other channels from the same pixel.
 		-- Which is to say I'm not sure Im' doing this right.
 
+		-- The h features for each input position at every layer in the
+		-- network are split into three parts, each corresponding to
+		-- one of the RGB channels. When predicting the R channel
+		-- for the current pixel xi
+		-- , only the generated pixels left
+		-- and above of xi can be used as context. When predicting
+		-- the G channel, the value of the R channel can also be used
+		-- as context in addition to the previously generated pixels.
+		-- Likewise, for the B channel, the values of both the R and
+		-- G channels can be used. To restrict connections in the network
+		-- to these dependencies, we apply a mask to the inputto-state
+		-- convolutions and to other purely convolutional layers
+		-- in a PixelRNN.
+		-- We use two types of masks that we indicate with mask A
+		-- and mask B, as shown in Figure 4. Mask A is applied
+		-- only to the first convolutional layer in a PixelRNN and restricts
+		-- the connections to those neighboring pixels and to
+		-- those colors in the current pixels that have already been
+		-- predicted. On the other hand, mask B is applied to all the
+		-- subsequent input-to-state convolutional transitions and relaxes
+		-- the restrictions of mask A by also allowing the connection
+		-- from a color to itself. The masks can be easily
+		-- implemented by zeroing out the corresponding weights in
+		-- the input-to-state convolutions after each update. Figure
+		-- 4 (right) shows the connections in each of the two masks.
+		-- Similar masks have also been used in (variational) autoencoders
+		-- (Gregor et al., 2014; Germain et al., 2015).
+
+		-- This reads as follows:
+		-- each pixel can use -all- of the channels of all previous pixels.
+		-- each pixel can only use its own and preceding channels of itself.
+
 		local graphAttributes = {
 			color = channel_colors[channel]
 		}
