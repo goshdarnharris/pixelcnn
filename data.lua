@@ -1,7 +1,6 @@
 
 require('csvigo')
 require('image')
-gfx = require('gfx.js')
 
 -- Partition data URLs into training and test sets
 -- From each of these we can sample a random image with a random mask

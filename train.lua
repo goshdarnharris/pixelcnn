@@ -4,7 +4,7 @@ require('nn')
 require('nngraph')
 require('pixelCNN')
 require('paths')
-optnet = require('optnet')
+--optnet = require('optnet')
 local gfx = require('display')
 
 cmd = torch.CmdLine()
@@ -144,7 +144,7 @@ function train(model, criterion, trainset, testset)
 				local input = batchInputs[torch.random(1,size)]
 				local output = model:forward(input)
 				local img = pixelCNN.toImage(output)
-				gfx.image({input, img}, {width = 500, win = "training output", title = "training"})
+				gfx.image({input, img}, {width = 300, win = "training output", title = "training"})
 				timer:reset()
 			end
 
@@ -185,7 +185,7 @@ function train(model, criterion, trainset, testset)
 
 		losses[epoch] = {epoch, val_loss, train_loss}
 
-		gfx.image({input, img}, {width = 500, win = "test output", title = "test"})
+		gfx.image({input, img}, {width = 300, win = "test output", title = "test"})
 		gfx.plot(losses, {win = "losses", labels = {'epoch', 'validation', 'training'}, title = "losses"})
 
 		learningRate = learningRate/(1+learningRateDecay)
