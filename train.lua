@@ -18,7 +18,7 @@ cmd:option("-batchsize", 128, "batch size")
 cmd:option("-cache", "cache", "image cache location")
 cmd:option("-images", 1000, "number of images to use")
 cmd:option("-embsize", false, "size of embedding vector")
-cmd:option("-learningrate", 1e-1, "initial learning rate")
+cmd:option("-learningrate", 1e-2, "initial learning rate")
 cmd:option("-learningratedecay", 4e-2, "learning rate decay per epoch")
 
 opt = cmd:parse(arg)
@@ -31,13 +31,17 @@ function train(model, criterion, trainset, testset)
 	local batchSize = opt.batchsize or 128
 	local learningRate = opt.learningrate
 	local learningRateDecay = opt.learningratedecay
-	local optimState = {learningRate = opt.learningRate}
+	local optimConfig = {learningRate = opt.learningRate}
+	local optimState = {}
 	local channels = 3
 	local epoch
+
+
 
 	local function do_loss(outputs, inputs)
 		local loss = {}
 		local dloss_doutput = {}
+		local accuracy = 0
 
 		for channel=1,channels do
 			if inputs:dim() > 3 then
@@ -53,6 +57,8 @@ function train(model, criterion, trainset, testset)
 						dloss_doutput[channel][{{},{},x,y}] = criterion:backward(out, target)
 					end
 				end
+
+				-- accuracy = accuracy + outputs[channel]:eq(target):mean()/channels
 			else
 				loss[channel] = torch.Tensor(opt.width, opt.height)
 				dloss_doutput[channel] = torch.Tensor(outputs[channel]:size())
@@ -69,7 +75,7 @@ function train(model, criterion, trainset, testset)
 			end
 		end
 
-		return loss, dloss_doutput
+		return loss, dloss_doutput, accuracy
 	end
 
 	local function mean_loss(loss)
@@ -83,6 +89,8 @@ function train(model, criterion, trainset, testset)
 	-- Train a single pass through the inputs.
 	local function step()
 		model:training()
+
+		local timer = torch.Timer()
 
 		local total_loss = 0		
 		local shuffle = torch.randperm(trainset.size)
@@ -101,6 +109,8 @@ function train(model, criterion, trainset, testset)
 				batchInputs[j] = input
 			end
 
+			local accuracy
+
 			-- Train the batch
 			local function feval(params)
 				gradParams:zero()
@@ -114,17 +124,30 @@ function train(model, criterion, trainset, testset)
 				-- backprop that through the network
 
 				local outputs = model:forward(batchInputs)
-				local loss, dloss_doutput = do_loss(outputs, batchInputs)
+				local loss, dloss_doutput
+				loss, dloss_doutput, accuracy = do_loss(outputs, batchInputs)
 				model:backward(batchInputs, dloss_doutput)
 
 				return loss, gradParams
 			end
 
-			_, result = optim.adagrad(feval, params, optimState)
+			_, result = optim.adam(feval, params, optimConfig, optimState)
 			total_loss = total_loss + mean_loss(result[1])
 
-			io.write(string.format("\rT: epoch %d: batch %d of %d: loss %.4f [mean %.4f]", epoch, math.ceil(batchIndex/batchSize), math.ceil(trainset.size/batchSize), mean_loss(result[1]), total_loss/(batchIndex/batchSize + 1)))
+			io.write(string.format("\rT: epoch %d: batch %d of %d: loss %.4f, accuracy %.2f [mean %.4f]", 
+				epoch, math.ceil(batchIndex/batchSize), math.ceil(trainset.size/batchSize), 
+				mean_loss(result[1]), total_loss/(batchIndex/batchSize + 1), accuracy))
 			io.flush()
+
+			if timer:time().real > 60 then
+				-- Let's give the fans something to talk about
+				local input = batchInputs[torch.random(1,size)]
+				local output = model:forward(input)
+				local img = pixelCNN.toImage(output)
+				gfx.image({input, img}, {width = 500, win = "training output", title = "training"})
+				timer:reset()
+			end
+
 		end
 
 		-- Return normalized loss
@@ -141,11 +164,12 @@ function train(model, criterion, trainset, testset)
 			local input = image.hsv2rgb(testset.data[i])
 			local output = model:forward(input)
 
-			local loss,_ = do_loss(output, input)
+			local loss,_,acc = do_loss(output, input)
+			accuracy = accuracy + acc
 			total_loss = mean_loss(result[1]) + total_loss			
 		end
 
-		return total_loss/testset.size
+		return total_loss/testset.size, accuracy/testset.size
 	end
 
 	local losses = {}
@@ -153,18 +177,16 @@ function train(model, criterion, trainset, testset)
 		epoch = i
 		local train_loss = step()
 		local val_loss, accuracy = validate()
-		print(string.format("\nV: epoch %d: training loss %.4f, validation loss %.4f [rate = %f]", i, train_loss, val_loss, learningRate))
+		print(string.format("\nV: epoch %d: training loss %.4f, validation loss %.4f, accuracy %.2f [rate = %f]", i, train_loss, val_loss, accuracy, learningRate))
 
 		local input = image.hsv2rgb(testset.data[torch.random(1,testset.size)])
 		local output = model:forward(input)
 		local img = pixelCNN.toImage(output)
 
-		-- print(input)
-		-- print(output[1][{{},{},1}])
-		losses[epoch] = {epoch, val_loss}
+		losses[epoch] = {epoch, val_loss, train_loss}
 
-		gfx.image({input, img}, {width = 500, win = "test output"})
-		gfx.plot(losses, {win = "losses", xlabel = "epoch", ylabel = "val loss", title = "losses"})
+		gfx.image({input, img}, {width = 500, win = "test output", title = "test"})
+		gfx.plot(losses, {win = "losses", labels = {'epoch', 'validation', 'training'}, title = "losses"})
 
 		learningRate = learningRate/(1+learningRateDecay)
 		torch.save(string.format("cv/model-%d-%.3f-%.3f.t7", i, train_loss, val_loss))
@@ -209,6 +231,7 @@ helper:addLayer(128, 7)
 helper:addLayer(128, 3)
 helper:addLayer(128, 3)
 helper:addLayer(128, 3)
+helper:addLayer(128, 3)
 
 local model = helper:generate("pixelcnn")
 
@@ -218,10 +241,9 @@ print(model:forward(torch.Tensor(3,32,32)))
 -- TODO: input pre-processing
 -- the paper uses centering and scaling; that's it.
 -- play with ZCA and HSV as well.
--- paper uses RMSProp for optimization.
--- nll loss function
 -- batch normalization?
-
+-- nngraph.display(pixelCNN.GatedPixelConvolution(1, 128, 7, 1, 1, 3, false))
+-- nngraph.display(helper.layers[2].layer)
 
 print(string.format("model has %d parameters", model:getParameters():size()[1]))
 

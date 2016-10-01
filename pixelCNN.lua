@@ -142,7 +142,11 @@ end
 function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, kernel_step, layer, channels, force_residual)
 	-- nInputPlane and nOutputPlane are per-channel. This will multiply accordingly.
 
-	force_residual = force_residual or true
+	-- Force residuals by default
+	if force_residual == undefined then force_residual = true end
+	-- If this is the first layer, disable residuals so information about the current pixel doesn't get through.
+	if layer == 1 then force_residual = false end
+
 	layer = layer or 3
 	channels = channels or 3
 
@@ -163,9 +167,6 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 	-- unit does (well, it has no weights)
 	-- That is, where there are currently single convolutions, I can maybe place concat layers to handle it
 	-- Or, I just put 3 of these in parallel with the appropriate # of planes, then narrow and concat as appropriate.
-
-	-- If nInputPlane and nOutputPlane are the same, force residuals.
-	if nInputPlane == nOutputPlane then force_residual = true end
 
 	-- TODO: implement dilated convolutions a la wavenet
 
@@ -191,12 +192,9 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 			math.floor(kernel_size/2), 
 			math.floor(kernel_size/2),
 			math.floor(kernel_size/2),
-			0)
+			-1)
 		vertical_conv = nn.SpatialConvolution(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH)
 		local params,_ = vertical_conv:getParameters()
-
-		-- We'll have 1 extra pixel on the bottom of the image. Get rid of it.
-		vertical_crop = nn.SpatialZeroPadding(0, 0, 0, -1)
 	end
 
 	-- Create horizontal padding, convolution, and crop
@@ -215,19 +213,16 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 			kW = math.ceil(kernel_size/2) -- Include the current pixel
 		end
 
-		horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), 0, 0, 0)
-
-		-- FIXME: needs to be masked for each channel as appropriate for the layer depth
-		horiz_conv = nn.SpatialConvolution(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH)
+		
 
 		if layer == 1 then
 			-- Sizes mean we'll still have 1 extra pixel on the right side of the image. Get rid of it.
-			horiz_crop = nn.SpatialZeroPadding(0, -1, 0, 0)
+			horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), -1, 0, 0)
 			-- We do a normal convolution with no mask; the current pixel is fully masked by the kernel width.
 			horiz_conv = nn.SpatialConvolution(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH)
 		else
 			-- Since other layers use a wider convolution, the extra pixel will already be gone.
-			horiz_crop = nn.Identity()
+			horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), 0, 0, 0)
 			
 			local test = torch.Tensor(2*nOutputPlane*channels, nInputPlane*channels, kH, kW):fill(1)
 
@@ -263,11 +258,6 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 		description = vertical_conv.kW .. 'x' .. vertical_conv.kH .. ' vertical convolution',
 	}
 
-	vconv_out = vertical_crop(vconv_out):annotate{
-		name = 'vcrop',
-		description = 'crop for vertical convolution',
-	}
-
 	vstack_out = pixelCNN.GAU(2*nOutputPlane*channels)(vconv_out):annotate{
 		name = 'vgate',
 		description = 'gated output for vertical stack',
@@ -285,13 +275,6 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 		name = 'hconv', 
 		description = horiz_conv.kW .. 'x' .. horiz_conv.kH .. ' horiz convolution',
 	}
-
-	hconv_out = horiz_crop(hconv_out):annotate{
-		name = 'hcrop',
-		description = 'crop for horiz convolution',
-	} -- Output is 1xn horizontal convolution
-
-
 
 	local vtohconv = nn.SpatialConvolution(2*nOutputPlane*channels, 2*nOutputPlane*channels, 1, 1, 1, 1)
 	local vconv_to_hconv = vtohconv(vconv_out):annotate{
@@ -364,6 +347,7 @@ function Helper:__init(opts)
 end
 
 function Helper:addLayer(nOutputPlane, kernel_size)
+
 	if #self.layers == 0 then
 		-- Create the input layer
 		self.layers[#self.layers+1] = {
