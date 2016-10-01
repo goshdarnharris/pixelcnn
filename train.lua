@@ -18,7 +18,7 @@ cmd:option("-batchsize", 128, "batch size")
 cmd:option("-cache", "cache", "image cache location")
 cmd:option("-images", 1000, "number of images to use")
 cmd:option("-embsize", false, "size of embedding vector")
-cmd:option("-learningrate", 1e-2, "initial learning rate")
+cmd:option("-learningrate", 1e-1, "initial learning rate")
 cmd:option("-learningratedecay", 4e-2, "learning rate decay per epoch")
 
 opt = cmd:parse(arg)
@@ -32,29 +32,52 @@ function train(model, criterion, trainset, testset)
 	local learningRate = opt.learningrate
 	local learningRateDecay = opt.learningratedecay
 	local optimState = {learningRate = opt.learningRate}
+	local channels = 3
 	local epoch
 
 	local function do_loss(outputs, inputs)
-		-- print(outputs:size())
-		-- print(inputs:size())
-		local loss = torch.Tensor(batchSize, opt.width, opt.height)
-		local dloss_doutput = torch.Tensor(outputs:size())
+		local loss = {}
+		local dloss_doutput = {}
 
-		for x=1,opt.width do
-			for y=1,opt.height do
-				-- print(outputs[{{},{},x,y}]:size(), inputs[{{},x,y}]:size())
-				local target = torch.floor(inputs[{{},{},x,y}]*255) + 1
-				-- print(target)
-				-- print(outputs:size())
-				-- print(inputs:size())
-				-- print(target)
+		for channel=1,channels do
+			if inputs:dim() > 3 then
+				loss[channel] = torch.Tensor(batchSize, opt.width, opt.height)
+				dloss_doutput[channel] = torch.Tensor(outputs[channel]:size())
 
-				loss[{{},x,y}] = criterion:forward(outputs[{{},{},x,y}], target)
-				dloss_doutput[{{},{},x,y}] = criterion:backward(outputs[{{},{},x,y}], target)
+				for x=1,opt.width do
+					for y=1,opt.height do
+						local classes = outputs[channel][1]:size()[1]
+						local target = torch.floor(inputs[{{},channel,x,y}]*(classes-1)) + 1
+						local out = outputs[channel][{{},{},x,y}]
+						loss[channel][{{},x,y}] = criterion:forward(out, target)
+						dloss_doutput[channel][{{},{},x,y}] = criterion:backward(out, target)
+					end
+				end
+			else
+				loss[channel] = torch.Tensor(opt.width, opt.height)
+				dloss_doutput[channel] = torch.Tensor(outputs[channel]:size())
+
+				for x=1,opt.width do
+					for y=1,opt.height do
+						local classes = outputs[channel]:size()[1]
+						local target = torch.floor(inputs[{channel,x,y}]*(classes-1)) + 1
+						local out = outputs[channel][{{},x,y}]
+						loss[channel][{x,y}] = criterion:forward(out, target)
+						dloss_doutput[channel][{{},x,y}] = criterion:backward(out, target)
+					end
+				end
 			end
 		end
 
 		return loss, dloss_doutput
+	end
+
+	local function mean_loss(loss)
+		local mean = 0
+		for channel=1,channels do
+			mean = mean + loss[channel]:mean()/channels
+		end
+		return mean
 	end
 
 	-- Train a single pass through the inputs.
@@ -69,13 +92,11 @@ function train(model, criterion, trainset, testset)
 			-- io.flush()
 			-- Create the batch
 			local size = math.min(batchIndex + batchSize, trainset.size) - batchIndex
-			local batchInputs = torch.Tensor(size, 1, opt.width, opt.height)
+			local batchInputs = torch.Tensor(size, 3, opt.width, opt.height)
 
 			for j=1,size do
 				local idx = shuffle[batchIndex+j]
-				local input = torch.Tensor(1,opt.width,opt.height)
-				input:zero()
-				input[{1,{},{}}] = trainset.data[idx]:select(1,3)
+				local input = image.hsv2rgb(trainset.data[idx])
 
 				batchInputs[j] = input
 			end
@@ -86,29 +107,23 @@ function train(model, criterion, trainset, testset)
 
 				-- Evaluating this model consists of:
 				-- a forward pass with the target image as input
-				-- a forward pass of the criterion for each pixel with the 256-long slice of log likelihoods (one for each possible value)
+				-- a forward pass of the criterion for each pixel with the <classes>-long slice of log likelihoods (one for each possible value)
 				-- a backward pass of the criterion for each of those
-				-- reassemble losses and dloss_doutput into the full image (N x M x 256, where each
+				-- reassemble losses and dloss_doutput into the full image (N x M x classes, where each
 				-- [n][m] index is a single criterion pass above)
 				-- backprop that through the network
 
-				-- Oy.
-
 				local outputs = model:forward(batchInputs)
-				-- print(#outputs)
 				local loss, dloss_doutput = do_loss(outputs, batchInputs)
 				model:backward(batchInputs, dloss_doutput)
-
-				-- loss = loss + opt.l2 * torch.norm(params,2)^2/2
-				-- loss = loss + opt.l1 * torch.norm(params,1)
 
 				return loss, gradParams
 			end
 
 			_, result = optim.adagrad(feval, params, optimState)
-			total_loss = total_loss + result[1]:mean()
+			total_loss = total_loss + mean_loss(result[1])
 
-			io.write(string.format("\rT: epoch %d: batch %d of %d: loss %.4f [mean %.4f]", epoch, math.ceil(batchIndex/size), math.ceil(trainset.size/size), result[1]:mean(), total_loss/(batchIndex/size + 1)))
+			io.write(string.format("\rT: epoch %d: batch %d of %d: loss %.4f [mean %.4f]", epoch, math.ceil(batchIndex/batchSize), math.ceil(trainset.size/batchSize), mean_loss(result[1]), total_loss/(batchIndex/batchSize + 1)))
 			io.flush()
 		end
 
@@ -117,42 +132,40 @@ function train(model, criterion, trainset, testset)
 	end
 
 	-- Evaluate the model against the test set.
-	local function test()
+	local function validate()
 		model:evaluate()
 
 		local total_loss = 0
 		local accuracy = 0
 		for i=1,testset.size do
-			local input = torch.Tensor(1,1,opt.width,opt.height)
-			input:zero()
-			input[{1,1,{},{}}] = testset.data[i]:select(1,3)
+			local input = image.hsv2rgb(testset.data[i])
 			local output = model:forward(input)
 
 			local loss,_ = do_loss(output, input)
-			-- total_loss = total_loss + criterion:forward(output, input):mean()
-			total_loss = loss:mean() + total_loss
-			local _,index = torch.max(output, 1)
+			total_loss = mean_loss(result[1]) + total_loss			
 		end
 
 		return total_loss/testset.size
 	end
 
-
+	local losses = {}
 	for i=1,opt.epochs do
 		epoch = i
 		local train_loss = step()
-		local val_loss, accuracy = test()
+		local val_loss, accuracy = validate()
 		print(string.format("\nV: epoch %d: training loss %.4f, validation loss %.4f [rate = %f]", i, train_loss, val_loss, learningRate))
 
-		-- FIXME: this is super ugly and needs to be cleaned up.
-		-- Which means that the pixelCNN needs to be modified to do multiple channels,
-		-- and properly select slices of the input when too many channels are provided as input. Maybe.
-		local input = testset.data[torch.random(1,testset.size)]
+		local input = image.hsv2rgb(testset.data[torch.random(1,testset.size)])
 		local output = model:forward(input)
 		local img = pixelCNN.toImage(output)
 
-		-- print(input[1]:size(), img[1]:size())
-		gfx.image({image.hsv2rgb(source), image.hsv2rgb(img)}, {width = 300, win = "asdf"})
+		-- print(input)
+		-- print(output[1][{{},{},1}])
+		losses[epoch] = {epoch, val_loss}
+
+		gfx.image({input, img}, {width = 500, win = "test output"})
+		gfx.plot(losses, {win = "losses", xlabel = "epoch", ylabel = "val loss", title = "losses"})
+
 		learningRate = learningRate/(1+learningRateDecay)
 		torch.save(string.format("cv/model-%d-%.3f-%.3f.t7", i, train_loss, val_loss))
 	end
@@ -190,78 +203,44 @@ end
 print("----- Creating model.")
 nngraph.setDebug(true)
 
-local model = nn.Sequential()
-model:add(pixelCNN.inputLayer(8, 7, 1))
-model:add(pixelCNN.GatedPixelConvolution(8, 16, 3, 1))
-
-
-model.name = "validate"
-print(infer(model, torch.Tensor(10,3,32,32))[1]:size())
-
-print(infer(model, torch.Tensor(3,32,32))[1]:size())
-
 
 local helper = pixelCNN.Helper()
-helper:addLayer(16, 7)
-helper:addLayer(32, 3)
+helper:addLayer(128, 7)
+helper:addLayer(128, 3)
+helper:addLayer(128, 3)
+helper:addLayer(128, 3)
 
-local model = helper:generate("test")
+local model = helper:generate("pixelcnn")
 
 -- print(infer(model, torch.Tensor(3,32,32)))
 print(model:forward(torch.Tensor(3,32,32)))
 
-nngraph.display(helper.layers[1].layer)
-nngraph.display(helper.layers[2].layer)
--- graph.dot(helper.layers[1].layer.fg, 'input', 'input')
--- graph.dot(helper.layers[2].layer.fg, 'pixelcnn', 'pixelcnn')
+-- TODO: input pre-processing
+-- the paper uses centering and scaling; that's it.
+-- play with ZCA and HSV as well.
+-- paper uses RMSProp for optimization.
+-- nll loss function
+-- batch normalization?
 
--- TODO: visualize the network after running to ensure that it's doing the job
--- properly. May be easiest to make it shit itself at the very last step.
 
--- local input = - nn.Replicate(2)
--- local network = input 
--- 	- nn.SplitTable(1)
--- 	- pixelCNN.GatedPixelConvolution(1, 64, 7, 1, 1) 
--- 	- pixelCNN.GatedPixelConvolution(64, 64, 5, 1, 2)
--- 	- pixelCNN.GatedPixelConvolution(64, 256, 5, 1, 3)
--- 	- pixelCNN.GatedPixelConvolution(256, 256, 5, 1, 4)
--- 	- nn.SelectTable(2)
--- 	- pixelCNN.MultiChannelSpatialSoftMax(1)
+print(string.format("model has %d parameters", model:getParameters():size()[1]))
 
--- -- TODO: input pre-processing
--- -- the paper uses centering and scaling; that's it.
--- -- play with ZCA and HSV as well.
--- -- paper uses RMSProp for optimization.
--- -- nll loss function
--- -- batch normalization?
+-- print(model:forward({torch.Tensor(3,32,32), torch.Tensor(3,32,32)}))
 
--- local model = nn.gModule({input}, {network})
--- model.name = "pixelcnn"
 
--- print(string.format("model has %d parameters", model:getParameters():size()[1]))
+-- gfx.image(pixelCNN.toImage({out}))
+print("Model valid.")
 
--- -- print(model:forward({torch.Tensor(3,32,32), torch.Tensor(3,32,32)}))
+print("----- Loading dataset.")
+print(string.format("cache location is %s", opt.cache))
 
--- local input = torch.rand(5,1,32,32)
+require('data')
+local trainset, testset = data.load("data/tgif-v1.0.tsv", opt.width, opt.height, opt.images, .9, opt.cache)
+print(string.format("training set has %d images", trainset.size))
+print(string.format("test set has %d images", testset.size))
 
--- -- graphgen(model, input, "unoptimized")
--- local time = torch.Timer()
--- local out = infer(model, input)
--- print("model takes " .. time:time().real .. "s")
--- print("output dims are", out:size())
+local criterion = nn.CrossEntropyCriterion()
 
--- -- gfx.image(pixelCNN.toImage({out}))
--- print("Model valid.")
-
--- print("----- Loading dataset.")
--- print(string.format("cache location is %s", opt.cache))
-
--- require('data')
--- local trainset, testset = data.load("data/tgif-v1.0.tsv", opt.width, opt.height, opt.images, .9, opt.cache)
--- print(string.format("training set has %d images", trainset.size))
--- print(string.format("test set has %d images", testset.size))
-
--- local criterion = nn.CrossEntropyCriterion()
-
--- print("----- Starting training.")
--- train(model, criterion, trainset, testset)
+print("----- Starting training.")
+torch.setnumthreads(4)
+train(model, criterion, trainset, testset)

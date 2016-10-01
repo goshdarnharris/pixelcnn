@@ -4,6 +4,7 @@
 require('torch')
 require('nn')
 require('nngraph')
+require('SpatialConvolutionMask')
 
 -- local GatedPixelConvolution = torch.class('GatedPixelConvolution')
 pixelCNN = {}
@@ -45,11 +46,13 @@ function pixelCNN.toImage(output)
 	local function getValues(channel)
 		local size = channel:size()
 		local values = torch.Tensor(width, height)
-		-- print(values:size())
+
 		for x=1,width do
 			for y=1,height do
 				local value, _
 				_,value = channel[{{},x,y}]:max(1)
+				-- print(channel[{{},x,y}])
+				-- print(value)
 				values[{x,y}] = value[1]/classes
 			end
 		end
@@ -68,7 +71,7 @@ function pixelCNN.toImage(output)
 				image[{batchIdx,idx,{},{}}] = getValues(channel[batchIdx])
 			end
 		else
-			image[channel] = getValues(channel)
+			image[{idx,{},{}}] = getValues(channel)
 		end
 	end
 
@@ -79,30 +82,23 @@ function pixelCNN.toImage(output)
 	return image
 end
 
-function pixelCNN.GAU(planes, left, right)
+function pixelCNN.GAU(nInputPlane, left, right)
 	left_type = left or nn.Tanh
 	right_type = right or nn.Sigmoid
 
 	local input = - nn.Identity()
 
 	local left = input 
-		- nn.Narrow(-3, 1, planes/2)
+		- nn.Narrow(-3, 1, nInputPlane/2)
 		- left_type()
 
 	local right = input
-		- nn.Narrow(-3, planes/2, planes/2)
+		- nn.Narrow(-3, nInputPlane/2, nInputPlane/2)
 		- right_type()
 
 	local gate = nn.CMulTable()({left,right})
 
 	return nn.gModule({input}, {gate})
-end
-
-function pixelCNN.MultiChannelSpatialSoftMax(channels)
-	if channels == 1 then
-		-- Easy degenerate case.
-		return nn.SpatialSoftMax()
-	end
 end
 
 function pixelCNN.inputLayer(nOutputPlane, kernel_size, kernel_step, channels)
@@ -133,6 +129,11 @@ function pixelCNN.outputLayer(nInputPlane, channels)
 			name = 'out_ch' .. channel,
 			description = 'split output for channel ' .. channel
 		}
+
+		outputs[channel] = nn.SpatialSoftMax()(outputs[channel]):annotate{
+			name = 'softmax_ch' .. channel,
+			description = 'softmax for channel ' .. channel
+		}
 	end
 
 	return nn.gModule({input}, outputs)
@@ -144,12 +145,6 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 	force_residual = force_residual or true
 	layer = layer or 3
 	channels = channels or 3
-
-	local channel_colors = {
-		'red',
-		'green',
-		'blue'
-	}
 
 	-- If we're at the first layer, we can't look at the current pixel.
 	-- If we're at a later layer, we can.
@@ -174,251 +169,188 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 
 	-- TODO: implement dilated convolutions a la wavenet
 
-	local hstack_in = {}
-	local hstack_out = {}
-	local vstack_in = {}
-	local vstack_out = {}
-	local hstack_in_all = - nn.Identity()
-	local hstack_out_all
-	local vstack_in_all = - nn.Identity()
-	local vstack_out_all
+	local hstack_in, hstack_out
+	local vstack_in, vstack_out
 
-	for channel=1,channels do
-
-		-- Each stack has a convolution that outputs 2*nOutputPlane features. These are split
-		-- at the gate; the first nOutputPlane features go to the left gate and the second
-		-- nOutputPlane features go to the right gate.
+	-- Each stack has a convolution that outputs 2*nOutputPlane features. These are split
+	-- at the gate; the first nOutputPlane features go to the left gate and the second
+	-- nOutputPlane features go to the right gate.
 
 
-		-- Create vertical padding, convolution, and crop
-		local vertical_conv, vertical_pad
-		do
-			local kW = kernel_size
-			local kH = math.floor(kernel_size/2) -- Paper says ceil. There are only floor rows above the current pixel...
-			local dW = kernel_step
-			local dH = kernel_step
-			local padW = 0
-			local padH = 0
+	-- Create vertical padding, convolution, and crop
+	local vertical_conv, vertical_pad
+	do
+		local kW = kernel_size
+		local kH = math.floor(kernel_size/2) -- Paper says ceil. There are only floor rows above the current pixel...
+		local dW = kernel_step
+		local dH = kernel_step
+		local padW = 0
+		local padH = 0
 
-			vertical_pad = nn.SpatialZeroPadding(
-				math.floor(kernel_size/2), 
-				math.floor(kernel_size/2),
-				math.floor(kernel_size/2),
-				0)
-			vertical_conv = nn.SpatialConvolution(nInputPlane*channel, 2*nOutputPlane, kW, kH, dW, dH, padW, padH)
-			local params,_ = vertical_conv:getParameters()
+		vertical_pad = nn.SpatialZeroPadding(
+			math.floor(kernel_size/2), 
+			math.floor(kernel_size/2),
+			math.floor(kernel_size/2),
+			0)
+		vertical_conv = nn.SpatialConvolution(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH)
+		local params,_ = vertical_conv:getParameters()
 
-			-- We'll have 1 extra pixel on the bottom of the image. Get rid of it.
-			vertical_crop = nn.SpatialZeroPadding(0, 0, 0, -1)
-		end
-
-		-- Create horizontal padding, convolution, and crop
-		local horiz_conv, horiz_pad
-		do
-			local kH = 1
-			local dW = kernel_step
-			local dH = kernel_step
-			local padW = 0
-			local padH = 0
-
-			local kW
-			if layer == 1 then
-				kW = math.floor(kernel_size/2) -- Don't include the current pixel
-			else
-				kW = math.ceil(kernel_size/2) -- Include the current pixel
-			end
-
-			horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), 0, 0, 0)
-			horiz_conv = nn.SpatialConvolution(nInputPlane*channel, 2*nOutputPlane, kW, kH, dW, dH, padW, padH)
-
-			if layer == 1 then
-				-- Sizes mean we'll still have 1 extra pixel on the right side of the image. Get rid of it.
-				horiz_crop = nn.SpatialZeroPadding(0, -1, 0, 0)
-			else
-				-- Since other layers use a wider convolution, the extra pixel will already be gone.
-				horiz_crop = nn.Identity()
-			end
-		end
-
-		-- Input to the layer is {tensor, tensor}. The first tensor goes to the vertical stack; the second to the
-		-- horizontal stack.
-
-		-- We need to select the features from the input corresponding to this channel and all before it.
-		-- We assume that the number of input planes (like the # of output planes we generate) is per-channel,
-		-- so for each channel we need to grab that many and all of the ones leading up to it.
-		-- channel 1 sees only channel 1
-		-- channel 2 sees channels 1 and 2
-		-- channel 3 sees channels 1, 2, and 3
-
-		-- FIXME: maybe not doing channels correctly
-		-- From the pixelRNN paper: p(xi,R|x<i)p(xi,G|x<i, xi,R)p(xi,B|x<i, xi,R, xi,G) = p(xi|x<i)
-		-- Each channel uses all channels from previous pixels and other channels from the same pixel.
-		-- Which is to say I'm not sure Im' doing this right.
-
-		-- The h features for each input position at every layer in the
-		-- network are split into three parts, each corresponding to
-		-- one of the RGB channels. When predicting the R channel
-		-- for the current pixel xi
-		-- , only the generated pixels left
-		-- and above of xi can be used as context. When predicting
-		-- the G channel, the value of the R channel can also be used
-		-- as context in addition to the previously generated pixels.
-		-- Likewise, for the B channel, the values of both the R and
-		-- G channels can be used. To restrict connections in the network
-		-- to these dependencies, we apply a mask to the inputto-state
-		-- convolutions and to other purely convolutional layers
-		-- in a PixelRNN.
-		-- We use two types of masks that we indicate with mask A
-		-- and mask B, as shown in Figure 4. Mask A is applied
-		-- only to the first convolutional layer in a PixelRNN and restricts
-		-- the connections to those neighboring pixels and to
-		-- those colors in the current pixels that have already been
-		-- predicted. On the other hand, mask B is applied to all the
-		-- subsequent input-to-state convolutional transitions and relaxes
-		-- the restrictions of mask A by also allowing the connection
-		-- from a color to itself. The masks can be easily
-		-- implemented by zeroing out the corresponding weights in
-		-- the input-to-state convolutions after each update. Figure
-		-- 4 (right) shows the connections in each of the two masks.
-		-- Similar masks have also been used in (variational) autoencoders
-		-- (Gregor et al., 2014; Germain et al., 2015).
-
-		-- This reads as follows:
-		-- each pixel can use -all- of the channels of all previous pixels.
-		-- each pixel can only use its own and preceding channels of itself.
-
-		local graphAttributes = {
-			color = channel_colors[channel]
-		}
-
-		vstack_in[channel] = nn.Narrow(-3, 1, channel*nInputPlane)(vstack_in_all):annotate{
-			name = 'vnarrow_ch' .. channel, 
-			description = 'narrow vertical input to channels 1-' .. channel,
-			graphAttributes = graphAttributes
-		}
-
-		local vconv_out = vertical_pad(vstack_in[channel]):annotate{
-			name = 'vpad_ch' .. channel, 
-			description = 'padding for vertical convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		vconv_out = vertical_conv(vconv_out):annotate{
-			name = 'vconv_ch' .. channel, 
-			description = vertical_conv.kW .. 'x' .. vertical_conv.kH .. ' vertical convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		vconv_out = vertical_crop(vconv_out):annotate{
-			name = 'vcrop_ch' .. channel,
-			description = 'crop for vertical convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		vstack_out[channel] = pixelCNN.GAU(2*nOutputPlane)(vconv_out):annotate{
-			name = 'vgate_ch' .. channel,
-			description = 'gated output for vertical stack (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}  -- Output is gated vertical convolution
-
-
-		hstack_in[channel] = nn.Narrow(-3, 1, channel*nInputPlane)(hstack_in_all):annotate{
-			name = 'hnarrow_ch' .. channel, 
-			description = 'narrow horiz input to channels 1-' .. channel,
-			graphAttributes = graphAttributes
-		}
-
-		local hconv_out = horiz_pad(hstack_in[channel]):annotate{
-			name = 'hpad_ch' .. channel, 
-			description = 'padding for horiz convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		hconv_out = horiz_conv(hconv_out):annotate{
-			name = 'hconv_ch' .. channel, 
-			description = horiz_conv.kW .. 'x' .. horiz_conv.kH .. ' horiz convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		hconv_out = horiz_crop(hconv_out):annotate{
-			name = 'hcrop_ch' .. channel,
-			description = 'crop for horiz convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		} -- Output is 1xn horizontal convolution
-
-
-
-		local vtohconv = nn.SpatialConvolution(2*nOutputPlane, 2*nOutputPlane, 1, 1, 1, 1)
-		local vconv_to_hconv = vtohconv(vconv_out):annotate{
-			name = 'vtohconv_ch' .. channel,
-			description = vtohconv.kW .. 'x' .. vtohconv.kH .. ' vertical conv -> horiz stack conv (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-
-		local hstack = nn.CAddTable()({hconv_out, vconv_to_hconv}):annotate{
-			name = 'vhadd_ch' .. channel,
-			description = 'add vertical convolution to horiz convolution (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		hstack = pixelCNN.GAU(2*nOutputPlane)(hstack):annotate{
-			name = 'hgate_ch' .. channel,
-			description = 'gated output for horiz stack (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		local hstack_outconv = nn.SpatialConvolution(nOutputPlane, nOutputPlane, 1, 1, 1, 1)
-		hstack = hstack_outconv(hstack):annotate{
-			name = 'hstackconv_ch' .. channel,
-			description = hstack_outconv.kW .. 'x' .. hstack_outconv.kH .. ' horiz stack output conv (ch' .. channel .. ')',
-			graphAttributes = graphAttributes
-		}
-
-		-- hstack output is gated elementwise addition of vconv output (convolved w/ 1x1 filter) and hconv output
-
-		-- Add residual on horizontal stack
-		
-		if force_residual then
-			if channel*nInputPlane == nOutputPlane then
-				-- If input and output dimensions are the same, we can just use the identity.
-				hstack_out[channel] = nn.CAddTable()({hstack_in[channel], hstack}):annotate{
-					name = 'hstack_residual_ch' .. channel,
-					description = 'horiz stack residual (ch' .. channel .. ')',
-					graphAttributes = graphAttributes
-				}
-			else
-				-- Otherwise, use a 1x1 convolution to transform dimensions.
-				local residual_conv = nn.SpatialConvolution(nInputPlane*channel, nOutputPlane, 1, 1, 1, 1)
-
-				local transform = residual_conv(hstack_in[channel]):annotate{
-					name = 'hstack_residualconv_ch' .. channel,
-					description = residual_conv.kW .. 'x' .. residual_conv.kH .. ' horiz stack residual transform (ch' .. channel .. ')',
-					graphAttributes = graphAttributes
-				}
-				hstack_out[channel] = nn.CAddTable()({transform, hstack}):annotate{
-					name = 'hstack_residual_ch' .. channel,
-					description = 'horiz stack residual (ch' .. channel .. ')',
-					graphAttributes = graphAttributes
-				}
-			end
-		else
-			-- hstack output is directly from the stack. no residual.
-			hstack_out[channel] = hstack
-		end
-
-		nngraph.annotateNodes()
-
+		-- We'll have 1 extra pixel on the bottom of the image. Get rid of it.
+		vertical_crop = nn.SpatialZeroPadding(0, 0, 0, -1)
 	end
 
-	-- Now we have the hstack and vstack inputs and outputs for each channel. Piece them together.
-	hstack_out_all = nn.JoinTable(1,3)(hstack_out)
-	vstack_out_all = nn.JoinTable(1,3)(vstack_out)
+	-- Create horizontal padding, convolution, and crop
+	local horiz_conv, horiz_pad
+	do
+		local kH = 1
+		local dW = kernel_step
+		local dH = kernel_step
+		local padW = 0
+		local padH = 0
+
+		local kW
+		if layer == 1 then
+			kW = math.floor(kernel_size/2) -- Don't include the current pixel
+		else
+			kW = math.ceil(kernel_size/2) -- Include the current pixel
+		end
+
+		horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), 0, 0, 0)
+
+		-- FIXME: needs to be masked for each channel as appropriate for the layer depth
+		horiz_conv = nn.SpatialConvolution(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH)
+
+		if layer == 1 then
+			-- Sizes mean we'll still have 1 extra pixel on the right side of the image. Get rid of it.
+			horiz_crop = nn.SpatialZeroPadding(0, -1, 0, 0)
+			-- We do a normal convolution with no mask; the current pixel is fully masked by the kernel width.
+			horiz_conv = nn.SpatialConvolution(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH)
+		else
+			-- Since other layers use a wider convolution, the extra pixel will already be gone.
+			horiz_crop = nn.Identity()
+			
+			local test = torch.Tensor(2*nOutputPlane*channels, nInputPlane*channels, kH, kW):fill(1)
+
+			-- But we need to mask the current pixel.
+			-- Each channel can only see itself and the preceding channels. All other channels in 
+			-- the kernels for a channel's output planes must be masked out.
+			function mask(weights)
+				for channel=1,channels-1 do
+					local start = nOutputPlane*(channel - 1) + 1
+					local stop = nOutputPlane*channel
+
+					weights[{{start, stop}, {nInputPlane*channel+1,nInputPlane*channels}, {}, kW}] = 0
+
+					-- Since there are two sets of outputs (one for each gate in the GAU), we need
+					-- to duplicate the first half of the mask into the second half
+					start = start + nOutputPlane*channels
+					stop = stop + nOutputPlane*channels
+					weights[{{start, stop}, {nInputPlane*channel+1,nInputPlane*channels}, {}, kW}] = 0
+				end
+			end
+
+			horiz_conv = nn.SpatialConvolutionMask(nInputPlane*channels, 2*nOutputPlane*channels, kW, kH, dW, dH, padW, padH, mask)
+		end
+	end
+
+	vstack_in = vertical_pad():annotate{
+		name = 'vpad', 
+		description = 'padding for vertical convolution',
+	}
+
+	local vconv_out = vertical_conv(vstack_in):annotate{
+		name = 'vconv', 
+		description = vertical_conv.kW .. 'x' .. vertical_conv.kH .. ' vertical convolution',
+	}
+
+	vconv_out = vertical_crop(vconv_out):annotate{
+		name = 'vcrop',
+		description = 'crop for vertical convolution',
+	}
+
+	vstack_out = pixelCNN.GAU(2*nOutputPlane*channels)(vconv_out):annotate{
+		name = 'vgate',
+		description = 'gated output for vertical stack',
+	}  -- Output is gated vertical convolution
+
+
+	hstack_in = nn.Identity()()
+
+	local hconv_out = horiz_pad(hstack_in):annotate{
+		name = 'hpad', 
+		description = 'padding for horiz convolution',
+	}
+
+	hconv_out = horiz_conv(hconv_out):annotate{
+		name = 'hconv', 
+		description = horiz_conv.kW .. 'x' .. horiz_conv.kH .. ' horiz convolution',
+	}
+
+	hconv_out = horiz_crop(hconv_out):annotate{
+		name = 'hcrop',
+		description = 'crop for horiz convolution',
+	} -- Output is 1xn horizontal convolution
+
+
+
+	local vtohconv = nn.SpatialConvolution(2*nOutputPlane*channels, 2*nOutputPlane*channels, 1, 1, 1, 1)
+	local vconv_to_hconv = vtohconv(vconv_out):annotate{
+		name = 'vtohconv',
+		description = vtohconv.kW .. 'x' .. vtohconv.kH .. ' vertical conv -> horiz stack conv',
+	}
+
+
+	local hstack = nn.CAddTable()({hconv_out, vconv_to_hconv}):annotate{
+		name = 'vhadd',
+		description = 'add vertical convolution to horiz convolution',
+	}
+
+	hstack = pixelCNN.GAU(2*nOutputPlane*channels)(hstack):annotate{
+		name = 'hgate',
+		description = 'gated output for horiz stack',
+	}
+
+	local hstack_outconv = nn.SpatialConvolution(nOutputPlane*channels, nOutputPlane*channels, 1, 1, 1, 1)
+	hstack = hstack_outconv(hstack):annotate{
+		name = 'hstackconv',
+		description = hstack_outconv.kW .. 'x' .. hstack_outconv.kH .. ' horiz stack output conv',
+	}
+
+	-- hstack output is gated elementwise addition of vconv output (convolved w/ 1x1 filter) and hconv output
+
+	-- Add residual on horizontal stack
+	
+	if force_residual then
+		if nInputPlane == nOutputPlane then
+			-- If input and output dimensions are the same, we can just use the identity.
+			hstack_out = nn.CAddTable()({hstack_in, hstack}):annotate{
+				name = 'hstack_residual',
+				description = 'horiz stack residual',
+			}
+		else
+			-- Otherwise, use a 1x1 convolution to transform dimensions.
+			local residual_conv = nn.SpatialConvolution(nInputPlane*channels, nOutputPlane*channels, 1, 1, 1, 1)
+
+			local transform = residual_conv(hstack_in):annotate{
+				name = 'hstack_residualconv',
+				description = residual_conv.kW .. 'x' .. residual_conv.kH .. ' horiz stack residual transform',
+			}
+			hstack_out = nn.CAddTable()({transform, hstack}):annotate{
+				name = 'hstack_residual',
+				description = 'horiz stack residual',
+			}
+		end
+	else
+		-- hstack output is directly from the stack. no residual.
+		hstack_out = hstack
+	end
+
+	nngraph.annotateNodes()
 
 	-- FIXME: is this correct? the paper mentions combining the outputs after each layer, but also
 	-- mentions that combining the horizontal stack with the vertical stack would allow the vertical
 	-- stack to see future pixels. Hmm.
-	return nn.gModule({vstack_in_all, hstack_in_all}, {vstack_out_all, hstack_out_all})
+	return nn.gModule({vstack_in, hstack_in}, {vstack_out, hstack_out})
 end
 
 local Helper = torch.class('pixelCNN.Helper')
@@ -460,7 +392,7 @@ function Helper:generate(name)
 		-- Try to run output through it so we can better debug the final assembly.
 		local status, err = pcall(function() model:forward(self.sample_input) end)
 		if err then
-			print("pixelCNN generation failed at layer " .. idx .. ": " .. tostring(layer))
+			print("pixelCNN generation failed at layer " .. idx .. ": " .. tostring(layer.layer))
 			error(err)
 		end
 	end
