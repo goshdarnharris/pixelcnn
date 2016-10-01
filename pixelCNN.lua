@@ -5,6 +5,7 @@ require('torch')
 require('nn')
 require('nngraph')
 require('SpatialConvolutionMask')
+require('BatchNarrow.lua')
 
 -- local GatedPixelConvolution = torch.class('GatedPixelConvolution')
 pixelCNN = {}
@@ -89,11 +90,11 @@ function pixelCNN.GAU(nInputPlane, left, right)
 	local input = - nn.Identity()
 
 	local left = input 
-		- nn.Narrow(-3, 1, nInputPlane/2)
+		- nn.BatchNarrow(-3, 1, nInputPlane/2)
 		- left_type()
 
 	local right = input
-		- nn.Narrow(-3, nInputPlane/2, nInputPlane/2)
+		- nn.BatchNarrow(-3, nInputPlane/2, nInputPlane/2)
 		- right_type()
 
 	local gate = nn.CMulTable()({left,right})
@@ -125,7 +126,7 @@ function pixelCNN.outputLayer(nInputPlane, channels)
 
 	for channel=1,channels do
 		local start = (channel - 1)*nInputPlane + 1
-		outputs[channel] = nn.Narrow(-3, start, nInputPlane)(input):annotate{
+		outputs[channel] = nn.BatchNarrow(-3, start, nInputPlane)(input):annotate{
 			name = 'out_ch' .. channel,
 			description = 'split output for channel ' .. channel
 		}
