@@ -1,5 +1,5 @@
 ##Pixel CNN
-Torch implementation of Deepmind's PixelCNN. Based on [Conditional Image Generation with PixelCNN Decoders](https://arxiv.org/abs/1606.05328) and [Pixel Recurrent Neural Networks](https://arxiv.org/abs/1601.06759).
+Torch implementation of DeepMind's PixelCNN. Based on [Conditional Image Generation with PixelCNN Decoders](https://arxiv.org/abs/1606.05328) and [Pixel Recurrent Neural Networks](https://arxiv.org/abs/1601.06759).
 
 This implementation currently uses images derived from the [TGIF](https://arxiv.org/abs/1604.02748) dataset.
 
