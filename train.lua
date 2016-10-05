@@ -123,7 +123,7 @@ function train(model, criterion, trainset, testset)
 				-- [n][m] index is a single criterion pass above)
 				-- backprop that through the network
 
-				local outputs = model:forward(batchInputs)
+				local outputs = model:forward({batchInputs, torch.Tensor(0)})
 				local loss, dloss_doutput
 				loss, dloss_doutput, accuracy = do_loss(outputs, batchInputs)
 				model:backward(batchInputs, dloss_doutput)
@@ -142,9 +142,9 @@ function train(model, criterion, trainset, testset)
 			if timer:time().real > 60 then
 				-- Let's give the fans something to talk about
 				local input = batchInputs[torch.random(1,size)]
-				local output = model:forward(input)
+				local output = model:forward({input, torch.Tensor(0)})
 				local img = pixelCNN.toImage(output)
-				gfx.image({input, img}, {width = 300, win = "training output", title = "training"})
+				gfx.image({input, img}, {width = 500, win = "training output", title = "training"})
 				timer:reset()
 			end
 
@@ -162,7 +162,7 @@ function train(model, criterion, trainset, testset)
 		local accuracy = 0
 		for i=1,testset.size do
 			local input = image.hsv2rgb(testset.data[i])
-			local output = model:forward(input)
+			local output = model:forward({input, torch.Tensor(0)})
 
 			local loss,_,acc = do_loss(output, input)
 			accuracy = accuracy + acc
@@ -180,12 +180,12 @@ function train(model, criterion, trainset, testset)
 		print(string.format("\nV: epoch %d: training loss %.4f, validation loss %.4f, accuracy %.2f [rate = %f]", i, train_loss, val_loss, accuracy, learningRate))
 
 		local input = image.hsv2rgb(testset.data[torch.random(1,testset.size)])
-		local output = model:forward(input)
+		local output = model:forward({input, torch.Tensor(0)})
 		local img = pixelCNN.toImage(output)
 
 		losses[epoch] = {epoch, val_loss, train_loss}
 
-		gfx.image({input, img}, {width = 300, win = "test output", title = "test"})
+		gfx.image({input, img}, {width = 500, win = "test output", title = "test"})
 		gfx.plot(losses, {win = "losses", labels = {'epoch', 'validation', 'training'}, title = "losses"})
 
 		learningRate = learningRate/(1+learningRateDecay)
@@ -194,12 +194,12 @@ function train(model, criterion, trainset, testset)
 
 end
 
-function infer(network, input)
+function infer(network, input, embedding)
 	local output
 	paths.rmall(network.name .. ".svg", "yes")
 
 	local go = function()
-		output = network:forward(input)
+		output = network:forward({input, embedding})
 	end
 
 	local status, err = pcall(go)
@@ -236,7 +236,7 @@ helper:addLayer(128, 3)
 local model = helper:generate("pixelcnn")
 
 -- print(infer(model, torch.Tensor(3,32,32)))
-print(model:forward(torch.Tensor(3,32,32)))
+print(model:forward({torch.Tensor(3,32,32), torch.Tensor(0)}))
 
 -- TODO: input pre-processing
 -- the paper uses centering and scaling; that's it.
@@ -245,7 +245,7 @@ print(model:forward(torch.Tensor(3,32,32)))
 -- nngraph.display(pixelCNN.GatedPixelConvolution(1, 128, 7, 1, 1, 3, false))
 -- nngraph.display(helper.layers[2].layer)
 
-print(string.format("model has %d parameters", model:getParameters():size()[1]))
+print(string.format("model has %d layers with %d parameters", #helper.layers, model:getParameters():size()[1]))
 
 -- print(model:forward({torch.Tensor(3,32,32), torch.Tensor(3,32,32)}))
 

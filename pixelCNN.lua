@@ -5,7 +5,8 @@ require('torch')
 require('nn')
 require('nngraph')
 require('SpatialConvolutionMask')
-require('BatchNarrow.lua')
+require('BatchNarrow')
+require('BiasTable')
 
 -- local GatedPixelConvolution = torch.class('GatedPixelConvolution')
 pixelCNN = {}
@@ -102,15 +103,29 @@ function pixelCNN.GAU(nInputPlane, left, right)
 	return nn.gModule({input}, {gate})
 end
 
-function pixelCNN.inputLayer(nOutputPlane, kernel_size, kernel_step, channels)
+function pixelCNN.inputLayer(nOutputPlane, kernel_size, kernel_step, embedding_size, channels)
 	channels = channels or 3
-	local input = nn.Replicate(2)():annotate{
-		name = 'rep', description = 'replicate input (x2)'
-	}
 
-	local layer = input 
-		- nn.SplitTable(1)
-		- pixelCNN.GatedPixelConvolution(1, nOutputPlane, kernel_size, kernel_step, 1, channels, false)
+	local input = nn.ConcatTable()
+
+	-- Input to vertical stack is just the input image
+	input:add(nn.SelectTable(1))
+
+	-- Input to horiz is a copy
+	local copy = nn.Sequential()
+	copy:add(nn.SelectTable(1))
+	copy:add(nn.Copy(torch.Tensor.__typename, torch.Tensor.__typename, true, true))
+
+	input:add(copy)
+
+	-- Embedding can go right through
+	input:add(nn.SelectTable(2))
+
+	-- Convert to a node
+	input = input()
+
+	local layer = input
+		- pixelCNN.GatedPixelConvolution(1, nOutputPlane, kernel_size, kernel_step, embedding_size, 1, channels, false)
 	layer:annotate{name = 'input layer', description = 'massage input, first pixel convolution layer'}
 
 	return nn.gModule({input}, {layer})
@@ -140,9 +155,9 @@ function pixelCNN.outputLayer(nInputPlane, channels)
 	return nn.gModule({input}, outputs)
 end
 
-function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, kernel_step, layer, channels, force_residual)
+function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, kernel_step, embedding_size, layer, channels, force_residual)
 	-- nInputPlane and nOutputPlane are per-channel. This will multiply accordingly.
-
+	
 	-- Force residuals by default
 	if force_residual == undefined then force_residual = true end
 	-- If this is the first layer, disable residuals so information about the current pixel doesn't get through.
@@ -173,10 +188,25 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 
 	local hstack_in, hstack_out
 	local vstack_in, vstack_out
-
+	local embedding_input, embedding_transform
 	-- Each stack has a convolution that outputs 2*nOutputPlane features. These are split
 	-- at the gate; the first nOutputPlane features go to the left gate and the second
 	-- nOutputPlane features go to the right gate.
+
+	-- If no embedding is used, this just forward the third input along to the next layer.
+	embedding_input = nn.Identity()():annotate{
+		name = 'emb_in',
+		description = 'pass through to forward embedding to next layer'
+	}
+
+	if embedding_size > 0 then
+		-- Create the linear transformation for the embedding. This will be added to
+		-- the convolution features as a bias immediately before they are gated.
+		embedding_transform = nn.Linear(embedding_size, 2*nOutputPlane*channels)(embedding_input):annotate{
+			name = 'emb',
+			description = 'transform embedding input'
+		}
+	end
 
 
 	-- Create vertical padding, convolution, and crop
@@ -259,6 +289,13 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 		description = vertical_conv.kW .. 'x' .. vertical_conv.kH .. ' vertical convolution',
 	}
 
+	if embedding_size > 0 then
+		vconv_out = nn.BiasTable()({vconv_out, embedding_transform}):annotate{
+			name = 'vbias',
+			description = 'apply embedding bias to vertical stack'
+		}
+	end
+
 	vstack_out = pixelCNN.GAU(2*nOutputPlane*channels)(vconv_out):annotate{
 		name = 'vgate',
 		description = 'gated output for vertical stack',
@@ -288,6 +325,13 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 		name = 'vhadd',
 		description = 'add vertical convolution to horiz convolution',
 	}
+
+	if embedding_size > 0 then
+		hstack = nn.BiasTable()({hstack, embedding_transform}):annotate{
+			name = 'hbias',
+			description = 'apply embedding bias to horiz stack'
+		}
+	end
 
 	hstack = pixelCNN.GAU(2*nOutputPlane*channels)(hstack):annotate{
 		name = 'hgate',
@@ -334,7 +378,10 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 	-- FIXME: is this correct? the paper mentions combining the outputs after each layer, but also
 	-- mentions that combining the horizontal stack with the vertical stack would allow the vertical
 	-- stack to see future pixels. Hmm.
-	return nn.gModule({vstack_in, hstack_in}, {vstack_out, hstack_out})
+
+	-- Each layer takes the previous layer's vertical and horizontal stacks as well as any embedding input.
+	-- The embedding input is used internally and forwarded unchanged to the next layer.
+	return nn.gModule({vstack_in, hstack_in, embedding_input}, {vstack_out, hstack_out, embedding_input})
 end
 
 local Helper = torch.class('pixelCNN.Helper')
@@ -343,7 +390,9 @@ function Helper:__init(opts)
 	opts = opts or {}
 	self.channels = opts.channels or 3
 	self.force_residual = opts.force_residual or true
-	self.sample_input = opts.input or torch.Tensor(3,32,32)
+	self.embedding_size = opts.embedding_size or 0
+	self.sample_input = opts.input or {torch.Tensor(3,32,32), torch.Tensor(self.embedding_size)}
+
 	self.layers = {}
 end
 
@@ -352,14 +401,14 @@ function Helper:addLayer(nOutputPlane, kernel_size)
 	if #self.layers == 0 then
 		-- Create the input layer
 		self.layers[#self.layers+1] = {
-			layer = pixelCNN.inputLayer(nOutputPlane, kernel_size, 1, self.channels),
+			layer = pixelCNN.inputLayer(nOutputPlane, kernel_size, 1, self.embedding_size, self.channels),
 			nOutputPlane = nOutputPlane
 		}
 	else
 		self.layers[#self.layers+1] = {
 			layer = pixelCNN.GatedPixelConvolution(
 				self.layers[#self.layers].nOutputPlane, nOutputPlane,
-				kernel_size, 1, #self.layers+1, self.channels, self.force_residual),
+				kernel_size, 1, self.embedding_size, #self.layers+1, self.channels, self.force_residual),
 			nOutputPlane = nOutputPlane
 		}
 	end
