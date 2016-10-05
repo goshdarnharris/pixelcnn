@@ -255,7 +255,7 @@ function pixelCNN.GatedPixelConvolution(nInputPlane, nOutputPlane, kernel_size, 
 			-- Since other layers use a wider convolution, the extra pixel will already be gone.
 			horiz_pad = nn.SpatialZeroPadding(math.floor(kernel_size/2), 0, 0, 0)
 			
-			local test = torch.Tensor(2*nOutputPlane*channels, nInputPlane*channels, kH, kW):fill(1)
+			-- local test = torch.Tensor(2*nOutputPlane*channels, nInputPlane*channels, kH, kW):fill(1)
 
 			-- But we need to mask the current pixel.
 			-- Each channel can only see itself and the preceding channels. All other channels in 
